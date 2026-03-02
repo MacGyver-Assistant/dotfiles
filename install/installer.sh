@@ -148,7 +148,7 @@ select_groups() {
     fi
 }
 
-# Select package install mode per group (two-pass: default all, optionally customize)
+# Select packages across all groups in a single flat filter screen
 select_group_packages() {
     unset GROUP_PACKAGE_MODE GROUP_CUSTOM_PACKAGE_LIST
     declare -gA GROUP_PACKAGE_MODE=()
@@ -163,69 +163,122 @@ select_group_packages() {
         GROUP_PACKAGE_MODE["$group"]="all"
     done
 
-    # Skip customize prompt if only 1 group selected
-    if [ ${#SELECTED_GROUP_NAMES[@]} -le 1 ]; then
+    # --- Collect packages and descriptions from all selected groups ---
+    local display_lines=()     # "[group] package -- description" for gum filter
+    local -A line_to_pkg=()    # display_line -> package name
+    local -A line_to_group=()  # display_line -> group name
+    local -A pkg_seen=()       # track dedup across groups
+    local -A group_total=()    # total package count per group
+
+    for group in "${SELECTED_GROUP_NAMES[@]}"; do
+        local group_file="$DOTFILES_DIR/packages/groups/$group.yaml"
+        [ -f "$group_file" ] || continue
+
+        # Load descriptions into an associative array
+        local -A descs=()
+        while IFS='=' read -r dkey dval; do
+            [ -n "$dkey" ] && descs["$dkey"]="$dval"
+        done < <(parse_descriptions "$group_file")
+
+        # Load packages for this distro
+        local pkg_count=0
+        while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            pkg_count=$((pkg_count + 1))
+
+            # Deduplicate: shared packages (e.g. waybar in hyprland+niri) appear once, tagged to first group
+            if [ -n "${pkg_seen[$pkg]}" ]; then
+                continue
+            fi
+            pkg_seen["$pkg"]="$group"
+
+            local desc="${descs[$pkg]:-}"
+            local display_line
+            if [ -n "$desc" ]; then
+                display_line="[$group] $pkg -- $desc"
+            else
+                display_line="[$group] $pkg"
+            fi
+
+            display_lines+=("$display_line")
+            line_to_pkg["$display_line"]="$pkg"
+            line_to_group["$display_line"]="$group"
+        done < <(parse_packages "$group_file" "$DISTRO")
+
+        group_total["$group"]=$pkg_count
+    done
+
+    # If zero packages across all groups, skip the filter UI
+    if [ ${#display_lines[@]} -eq 0 ]; then
+        print_warning "No $DISTRO packages found for the selected groups."
+        for group in "${SELECTED_GROUP_NAMES[@]}"; do
+            GROUP_PACKAGE_MODE["$group"]="skip"
+        done
         return 0
     fi
 
-    # Ask which groups to customize (single multi-select screen)
+    # --- Show single gum filter screen (all pre-selected) ---
     echo ""
-    gum style --foreground 212 --bold "Customize packages?"
+    gum style --foreground 212 --bold "Select packages to install:"
     echo ""
-    print_info "By default, all packages in each group are installed."
-    print_info "Select groups below to pick individual packages instead."
+    print_info "All packages are pre-selected. Deselect any you don't want."
+    print_info "Type to fuzzy-search, Space to toggle, Enter to confirm."
     echo ""
 
-    local customize_labels=()
-    local -A clabel_to_group=()
-    for group in "${SELECTED_GROUP_NAMES[@]}"; do
-        local group_file="$DOTFILES_DIR/packages/groups/$group.yaml"
-        local icon=""
-        if command_exists yq; then
-            icon=$(yq -r '.icon // ""' "$group_file")
-        else
-            icon=$(grep "^icon:" "$group_file" | sed 's/icon:[[:space:]]*//')
-        fi
-        local label="$icon $group"
-        customize_labels+=("$label")
-        clabel_to_group["$label"]="$group"
+    # Build gum filter args with all items pre-selected
+    local filter_args=(--no-limit --height=20 --header "Packages"
+        --selected.foreground="212")
+    for line in "${display_lines[@]}"; do
+        filter_args+=(--selected "$line")
     done
 
-    local selected_custom
-    selected_custom=$(printf '%s\n' "${customize_labels[@]}" \
-        | gum choose --no-limit --header "Space to select, Enter to confirm (or Enter with none to install all)") || true
+    local filter_output
+    filter_output=$(printf '%s\n' "${display_lines[@]}" \
+        | gum filter "${filter_args[@]}")
 
-    # Process customized groups
+    # --- Parse output back into GROUP_PACKAGE_MODE / GROUP_CUSTOM_PACKAGE_LIST ---
+    # Build set of selected packages per group
+    local -A group_selected=()   # group -> newline-separated package list
+    local -A group_sel_count=()  # group -> count of selected packages
+
     local line
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        local group="${clabel_to_group[$line]}"
-        [ -z "$group" ] && continue
+        local pkg="${line_to_pkg[$line]}"
+        local grp="${line_to_group[$line]}"
+        [ -z "$pkg" ] || [ -z "$grp" ] && continue
 
-        local group_file="$DOTFILES_DIR/packages/groups/$group.yaml"
-        local all_packages=()
-        while IFS= read -r pkg; do
-            [ -n "$pkg" ] && all_packages+=("$pkg")
-        done < <(parse_packages "$group_file" "$DISTRO")
-
-        if [ ${#all_packages[@]} -eq 0 ]; then
-            print_warning "No $DISTRO packages for '$group'; skipping."
-            GROUP_PACKAGE_MODE["$group"]="skip"
-            continue
+        if [ -z "${group_selected[$grp]}" ]; then
+            group_selected["$grp"]="$pkg"
+        else
+            group_selected["$grp"]="${group_selected[$grp]}"$'\n'"$pkg"
         fi
+        group_sel_count["$grp"]=$(( ${group_sel_count[$grp]:-0} + 1 ))
+    done <<< "$filter_output"
 
-        local selected_packages
-        selected_packages=$(printf '%s\n' "${all_packages[@]}" \
-            | gum choose --no-limit --header "Select packages for '$group'")
-
-        if [ -z "$selected_packages" ]; then
+    # Handle empty selection (user pressed Enter with nothing selected)
+    if [ -z "$filter_output" ]; then
+        print_warning "No packages selected — only dotfiles/services will be applied."
+        for group in "${SELECTED_GROUP_NAMES[@]}"; do
             GROUP_PACKAGE_MODE["$group"]="skip"
-            print_warning "No packages selected for '$group'; only dotfiles/services will apply."
+        done
+        return 0
+    fi
+
+    # Map selections back to per-group mode
+    for group in "${SELECTED_GROUP_NAMES[@]}"; do
+        local total="${group_total[$group]:-0}"
+        local selected="${group_sel_count[$group]:-0}"
+
+        if [ "$selected" -eq 0 ]; then
+            GROUP_PACKAGE_MODE["$group"]="skip"
+        elif [ "$selected" -ge "$total" ]; then
+            GROUP_PACKAGE_MODE["$group"]="all"
         else
             GROUP_PACKAGE_MODE["$group"]="custom"
-            GROUP_CUSTOM_PACKAGE_LIST["$group"]="$selected_packages"
+            GROUP_CUSTOM_PACKAGE_LIST["$group"]="${group_selected[$group]}"
         fi
-    done <<< "$selected_custom"
+    done
 }
 
 # Confirm installation
@@ -236,12 +289,40 @@ confirm_installation() {
     echo "  • Distribution: $DISTRO_NAME"
     echo "  • Base packages: Yes"
     if [ ${#SELECTED_GROUP_NAMES[@]} -gt 0 ]; then
-        echo "  • Groups: ${SELECTED_GROUP_NAMES[*]}"
+        echo "  • Groups:"
+        for group in "${SELECTED_GROUP_NAMES[@]}"; do
+            local mode="${GROUP_PACKAGE_MODE[$group]:-all}"
+            local group_file="$DOTFILES_DIR/packages/groups/$group.yaml"
+            local total=0
+            while IFS= read -r pkg; do
+                [ -n "$pkg" ] && total=$((total + 1))
+            done < <(parse_packages "$group_file" "$DISTRO")
+
+            case "$mode" in
+                all)
+                    echo "      $group: all $total packages"
+                    ;;
+                custom)
+                    local selected=0
+                    while IFS= read -r pkg; do
+                        [ -n "$pkg" ] && selected=$((selected + 1))
+                    done <<< "${GROUP_CUSTOM_PACKAGE_LIST[$group]}"
+                    echo "      $group: $selected / $total packages"
+                    ;;
+                skip)
+                    if [ "$total" -gt 0 ]; then
+                        echo "      $group: skipped (dotfiles/services only)"
+                    else
+                        echo "      $group: dotfiles/services only"
+                    fi
+                    ;;
+            esac
+        done
     else
         echo "  • Groups: None"
     fi
     echo ""
-    
+
     if gum confirm "Proceed with installation?"; then
         return 0
     else
