@@ -111,20 +111,11 @@ def run_tui(stdscr, groups):
     curses.curs_set(0)
     curses.use_default_colors()
 
-    # Color pairs
-    curses.init_pair(1, curses.COLOR_MAGENTA, -1)  # group name
-    curses.init_pair(2, curses.COLOR_CYAN, -1)  # description
-    curses.init_pair(3, curses.COLOR_GREEN, -1)  # check mark
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)  # partial
-    curses.init_pair(5, curses.COLOR_WHITE, -1)  # normal
-    curses.init_pair(6, curses.COLOR_RED, -1)  # cancel hint
+    # Light color scheme — single accent, like gum
+    curses.init_pair(1, curses.COLOR_MAGENTA, -1)  # accent (cursor indicator)
 
-    COL_GROUP = curses.color_pair(1) | curses.A_BOLD
-    COL_DESC = curses.color_pair(2)
-    COL_CHECK = curses.color_pair(3)
-    COL_PARTIAL = curses.color_pair(4)
-    COL_NORMAL = curses.color_pair(5)
-    COL_DIM = curses.color_pair(5) | curses.A_DIM
+    COL_ACCENT = curses.color_pair(1) | curses.A_BOLD
+    COL_DIM = curses.A_DIM
 
     cursor = 0
     scroll_offset = 0
@@ -162,7 +153,7 @@ def run_tui(stdscr, groups):
             padding = 1
         try:
             stdscr.addstr(0, 0, header, curses.A_BOLD)
-            stdscr.addstr(0, len(header) + padding, counter, COL_DESC)
+            stdscr.addstr(0, len(header) + padding, counter, COL_DIM)
         except curses.error:
             pass
 
@@ -199,53 +190,48 @@ def run_tui(stdscr, groups):
             y = 2 + i
             is_cursor = ri == cursor
 
+            # Cursor row: magenta accent; other rows: default
+            row_attr = COL_ACCENT if is_cursor else 0
+
             if row_type == "group":
                 g = groups[gi]
                 arrow = "▼" if g.expanded else "▶"
                 state = g.check_state
                 if state == CHECK_ALL:
                     check_str = "[x]"
-                    check_col = COL_CHECK
                 elif state == CHECK_PARTIAL:
                     check_str = "[-]"
-                    check_col = COL_PARTIAL
                 else:
                     check_str = "[ ]"
-                    check_col = COL_NORMAL
 
                 # Count string
-                if state == CHECK_ALL:
-                    cnt = f"({g.total_count} packages)"
-                elif state == CHECK_NONE:
-                    cnt = f"({g.total_count} packages)"
-                else:
+                if state == CHECK_PARTIAL:
                     cnt = f"({g.selected_count}/{g.total_count})"
+                else:
+                    cnt = f"({g.total_count} packages)"
 
-                line_attr = curses.A_REVERSE if is_cursor else 0
                 try:
-                    stdscr.addstr(y, 0, " " * max_x, line_attr)
-                    stdscr.addstr(y, 2, arrow, line_attr)
-                    stdscr.addstr(y, 4, check_str, check_col | line_attr)
-                    label = f" {g.icon} {g.name} {cnt}"
-                    stdscr.addnstr(y, 8, label, max_x - 9, COL_GROUP | line_attr)
+                    stdscr.addstr(y, 2, arrow, row_attr)
+                    stdscr.addstr(y, 4, check_str, row_attr)
+                    label = f" {g.icon} {g.name} "
+                    stdscr.addnstr(y, 8, label, max_x - 9, row_attr | curses.A_BOLD)
+                    cnt_x = 8 + min(len(label), max_x - 9)
+                    stdscr.addnstr(y, cnt_x, cnt, max_x - cnt_x - 1, COL_DIM if not is_cursor else row_attr)
                 except curses.error:
                     pass
 
             else:  # package row
                 p = groups[gi].packages[pi]
                 check_str = "[x]" if p.selected else "[ ]"
-                check_col = COL_CHECK if p.selected else COL_NORMAL
 
-                if p.desc:
-                    label = f"{p.name} — {p.desc}"
-                else:
-                    label = p.name
-
-                line_attr = curses.A_REVERSE if is_cursor else 0
                 try:
-                    stdscr.addstr(y, 0, " " * max_x, line_attr)
-                    stdscr.addstr(y, 6, check_str, check_col | line_attr)
-                    stdscr.addnstr(y, 10, label, max_x - 11, COL_NORMAL | line_attr)
+                    stdscr.addstr(y, 6, check_str, row_attr)
+                    name_str = p.name
+                    stdscr.addnstr(y, 10, name_str, max_x - 11, row_attr)
+                    if p.desc:
+                        desc_x = 10 + min(len(name_str), max_x - 11)
+                        desc_str = f" — {p.desc}"
+                        stdscr.addnstr(y, desc_x, desc_str, max_x - desc_x - 1, COL_DIM if not is_cursor else row_attr)
                 except curses.error:
                     pass
 
